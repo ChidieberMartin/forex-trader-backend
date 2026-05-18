@@ -1,4 +1,5 @@
 from django.apps import AppConfig
+import sys
 import threading
 
 class ForexConfig(AppConfig):
@@ -6,10 +7,13 @@ class ForexConfig(AppConfig):
     name = 'forex'
     
     def ready(self):
-        # start deriv connection when django starts
+        # Only start deriv connection for runserver, not management commands
+        if len(sys.argv) > 1 and sys.argv[1] not in ['runserver', 'runserver_plus', 'uvicorn']:
+            return
+        
+        # Import here to avoid loading models at module level
         from .deriv_client import start_deriv_connection
         
-        # Start separete thread to avoid django startup
         connection_thread = threading.Thread(target=start_deriv_connection)
         connection_thread.daemon = True
         connection_thread.start()
