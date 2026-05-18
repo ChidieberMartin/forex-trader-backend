@@ -28,7 +28,7 @@ SECRET_KEY = 'django-insecure-_oe8gy_t(&#ap85ta6v8z^r&wn8kmmpmbvv%f-)dju5h^!t(ps
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'True'
 
-ALLOWED_HOSTS = ['localhost','127.0.0.1']
+ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
 
 # Application definition
@@ -91,12 +91,12 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.mysql',   # Use MySQL backend
-        'NAME': 'my_forex_db',                 # Database name
-        'USER': 'root',                 # MySQL username
-        'PASSWORD': '',         # MySQL password
-        'HOST': '127.0.0.1',                    # Or 'localhost' or server IP
-        'PORT': '3306',                         # Default MySQL port
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': os.getenv('MYSQL_DATABASE', 'my_forex_db'),
+        'USER': os.getenv('MYSQL_USER', 'root'),
+        'PASSWORD': os.getenv('MYSQL_PASSWORD', ''),
+        'HOST': os.getenv('MYSQL_HOST', '127.0.0.1'),
+        'PORT': os.getenv('MYSQL_PORT', '3306'),
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'"
         }
