@@ -37,7 +37,10 @@ class DerivAPIClient:
     def connect(self):
         """Connect to Deriv WebSocket API"""
         try:
-            websocket.enableTrace(True)
+            # Never enable the websocket trace here: it logs every frame,
+            # including the {"authorize": <api_token>} payload, to stdout.
+            if settings.DEBUG:
+                logger.debug('Deriv websocket debug trace is opt-in; see deriv_client.connect')
             self.ws = websocket.WebSocketApp(
                 f"{settings.DERIV_API_URL}?app_id={self.app_id}",
                 on_open=self.on_open,

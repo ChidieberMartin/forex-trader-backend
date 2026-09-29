@@ -10,7 +10,9 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
 import os
+from decimal import Decimal
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 import dj_database_url
 
@@ -24,13 +26,48 @@ load_dotenv()
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-_oe8gy_t(&#ap85ta6v8z^r&wn8kmmpmbvv%f-)dju5h^!t(ps'
-
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DEBUG', 'False').lower() == 'True'
+# Previously this compared os.getenv(...).lower() == 'True', which can never
+# match -- DEBUG was permanently False regardless of the env var.
+DEBUG = os.getenv('DEBUG', 'False').strip().lower() in {'true', '1', 'yes', 'on'}
 
-ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+# SECURITY WARNING: keep the secret key used in production secret!
+# The key is read from the environment only; it is never committed to the repo.
+SECRET_KEY = os.getenv('SECRET_KEY', '').strip()
+_PLACEHOLDER_SECRETS = {'', 'your-django-secret-key-here', 'changeme'}
+if SECRET_KEY.lower() in _PLACEHOLDER_SECRETS:
+    if not DEBUG:
+        raise ImproperlyConfigured(
+            'SECRET_KEY must be set to a real value in the environment. '
+            'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(64))"'
+        )
+    SECRET_KEY = 'django-insecure-development-only-do-not-use-in-production'
+
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+    if host.strip()
+]
+if not DEBUG and set(ALLOWED_HOSTS) <= {'localhost', '127.0.0.1'}:
+    raise ImproperlyConfigured(
+        'DJANGO_ALLOWED_HOSTS must list the real hostnames in production.'
+    )
+
+
+# ===========================
+# Email Configuration
+# ===========================
+EMAIL_BACKEND = os.getenv(
+    'EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend'
+)
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '465'))
+EMAIL_HOST_USER = os.getenv('EMAIL_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_PASSWORD', '')
+EMAIL_USE_SSL = os.getenv('EMAIL_SECURE', 'true').lower() == 'true'
+EMAIL_USE_TLS = os.getenv('EMAIL_TLS', 'false').lower() == 'true'
+DEFAULT_FROM_EMAIL = os.getenv('EMAIL_GENERAL', EMAIL_HOST_USER)
+ADMIN_PANEL_URL = os.getenv('ADMIN_PANEL_URL', '')
 
 
 # Application definition
@@ -44,6 +81,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'forex',
     'rest_framework',
+    'rest_framework.authtoken',
     'corsheaders',
 ]
 
@@ -58,14 +96,46 @@ MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
 ]
 
-REST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.AllowAny',]}
+REST_FRAMEWORK = {
+    # Fail closed: a view without an explicit decorator is never public.
+    # The handful of genuinely public endpoints opt out with @permission_classes([AllowAny]).
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'forex.authentication.BearerTokenAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': os.getenv('THROTTLE_ANON', '60/hour'),
+        'user': os.getenv('THROTTLE_USER', '600/hour'),
+    },
+}
 
-CORS_ALLOW_ORIGINS = [
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        'CORS_ALLOWED_ORIGINS',
+        'http://localhost:3000,http://127.0.0.1:3000',
+    ).split(',')
+    if origin.strip()
 ]
+CORS_ALLOW_CREDENTIALS = True
 
-CORS_ALLOW_ALL_ORIGINS = True
+# Hardening applied whenever DEBUG is off (i.e. any real deployment).
+if not DEBUG:
+    SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'True').lower() == 'true'
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '31536000'))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    X_FRAME_OPTIONS = 'DENY'
 
 ROOT_URLCONF = 'backend.urls'
 
@@ -96,6 +166,15 @@ DATABASES = {
         default='sqlite:///' + str(BASE_DIR / 'db.sqlite3'),
     )
 }
+_db_engine = str(DATABASES['default'].get('ENGINE') or '')
+# SQLite has no row-level locking, so select_for_update() silently does
+# nothing. A money app must never fall back to it unnoticed. (dj_database_url
+# returns an empty dict when DATABASE_URL is set but blank, hence the "" case.)
+if not DEBUG and (not _db_engine or _db_engine.endswith('sqlite3')):
+    raise ImproperlyConfigured(
+        'DATABASE_URL must point at a real database in production; '
+        'refusing to fall back to SQLite.'
+    )
 
 
 
@@ -134,6 +213,27 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 
 STATIC_URL = 'static/'
+
+# Uploaded files (e.g. KYC documents)
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+# Paystack (Nigeria payment gateway)
+PAYSTACK_PUBLIC_KEY = os.getenv('PAYSTACK_PUBLIC_KEY', '')
+PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY', '')
+PAYSTACK_BASE_URL = os.getenv('PAYSTACK_BASE_URL', 'https://api.paystack.co')
+if not DEBUG and (
+    not PAYSTACK_SECRET_KEY or PAYSTACK_SECRET_KEY.startswith('sk_test_')
+):
+    raise ImproperlyConfigured(
+        'PAYSTACK_SECRET_KEY must be set to a live secret key in production.'
+    )
+
+# Service charges (percentage fees deducted from funding and withdrawals)
+# Money is handled as Decimal end-to-end; never float.
+FUNDING_FEE_PERCENT = Decimal(os.getenv('FUNDING_FEE_PERCENT', '1.5'))
+WITHDRAWAL_FEE_PERCENT = Decimal(os.getenv('WITHDRAWAL_FEE_PERCENT', '1.5'))
+MIN_WITHDRAWAL = Decimal(os.getenv('MIN_WITHDRAWAL', '1000'))
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field

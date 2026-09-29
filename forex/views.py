@@ -5,9 +5,16 @@ import requests
 from decimal import Decimal
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.decorators import api_view
+from rest_framework.decorators import (
+    api_view,
+    authentication_classes,
+    permission_classes,
+)
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from .models import CurrencyPair, PriceData, Trade, DerivAccount
+from .authentication import BearerTokenAuthentication
+from .models import CurrencyPair, PriceData, Trade, DerivAccount, Profile
+from .permissions import IsAdminUser
 from .deriv_client import deriv_client
 import talib
 import numpy as np
@@ -16,7 +23,12 @@ from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on a single order's size, in lots. Anything larger is rejected
+# outright rather than merely flagged by the fraud engine after the fact.
+MAX_TRADE_QUANTITY = Decimal('100')
+
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def get_currency_pairs(request):
     """Get all available currency pairs"""
     pairs = CurrencyPair.objects.filter(is_active=True)
@@ -24,6 +36,7 @@ def get_currency_pairs(request):
     return Response(data)
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def get_live_prices(request):
     """Get current prices for all active currency pairs"""
     pairs = CurrencyPair.objects.filter(is_active=True)
@@ -43,6 +56,7 @@ def get_live_prices(request):
     return Response(prices)
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def get_price_history(request, symbol):
     """Get historical price data for technical analysis"""
     try:
@@ -63,6 +77,7 @@ def get_price_history(request, symbol):
         return Response({'error': 'Currency pair not found'}, status=404)
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def get_technical_analysis(request, symbol):
     """Calculate technical indicators using real Deriv data"""
     try:
@@ -105,66 +120,146 @@ def get_technical_analysis(request, symbol):
         return Response(analysis)
     except CurrencyPair.DoesNotExist:
         return Response({'error': 'Currency pair not found'}, status=404)
-    except Exception as e:
-        logger.error(f"Error in technical analysis: {e}")
-        return Response({'error': str(e)}, status=500)
+    except Exception:
+        logger.exception('Error in technical analysis')
+        return Response(
+            {'error': 'Could not compute analysis.'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(['POST'])
+@authentication_classes([BearerTokenAuthentication])
+@permission_classes([IsAuthenticated])
 def place_trade(request):
     """Place a new trade using Deriv API"""
     try:
+        profile = getattr(request.user, 'profile', None)
+        if profile is None:
+            profile = Profile.objects.get_or_create(user=request.user)[0]
+
+        if profile.account_type == 'live' and not request.user.identity_verifications.filter(
+            status='approved'
+        ).exists():
+            return Response(
+                {
+                    'error': 'Live trading requires an approved identity verification. Complete KYC first.',
+                    'code': 'KYC_REQUIRED',
+                },
+                status=403,
+            )
+
         data = request.data
-        pair = CurrencyPair.objects.get(symbol=data['symbol'])
-        
+
+        symbol = (data.get('symbol') or '').strip()
+        trade_type = (data.get('trade_type') or '').strip().upper()
+        if trade_type not in dict(Trade.TRADE_TYPES):
+            return Response(
+                {'error': 'trade_type must be BUY or SELL.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            quantity = Decimal(str(data.get('quantity')))
+        except (TypeError, ValueError, ArithmeticError):
+            return Response(
+                {'error': 'quantity must be a number.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not quantity.is_finite():
+            return Response(
+                {'error': 'quantity must be a finite number.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if quantity <= 0 or quantity > MAX_TRADE_QUANTITY:
+            return Response(
+                {
+                    'error': (
+                        f'quantity must be between 0 and {MAX_TRADE_QUANTITY}.'
+                    ),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            pair = CurrencyPair.objects.get(symbol=symbol)
+        except CurrencyPair.DoesNotExist:
+            return Response({'error': 'Currency pair not found'}, status=404)
+
+        def _optional_decimal(key):
+            raw = data.get(key)
+            if raw in (None, ''):
+                return None
+            try:
+                value = Decimal(str(raw))
+            except (TypeError, ValueError, ArithmeticError):
+                raise ValueError(key)
+            if not value.is_finite() or value < 0:
+                raise ValueError(key)
+            return value
+
+        try:
+            stop_loss = _optional_decimal('stop_loss')
+            take_profit = _optional_decimal('take_profit')
+        except ValueError as exc:
+            return Response(
+                {'error': f'{exc.args[0]} must be a positive number.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Get current price from our database
         latest_price = PriceData.objects.filter(currency_pair=pair).first()
         if not latest_price:
             return Response({'error': 'No price data available'}, status=400)
         
         # Determine entry price
-        entry_price = latest_price.ask_price if data['trade_type'] == 'BUY' else latest_price.bid_price
+        entry_price = latest_price.ask_price if trade_type == 'BUY' else latest_price.bid_price
         
         # Create trade record
         trade = Trade.objects.create(
             currency_pair=pair,
-            trade_type=data['trade_type'],
+            trade_type=trade_type,
             entry_price=entry_price,
-            quantity=Decimal(data['quantity']),
-            stop_loss=Decimal(data.get('stop_loss', 0)) if data.get('stop_loss') else None,
-            take_profit=Decimal(data.get('take_profit', 0)) if data.get('take_profit') else None
+            quantity=quantity,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
         )
         
         # Place order through Deriv API
         if deriv_client.is_connected:
             result = deriv_client.place_trade_order(
-                symbol=data['symbol'],
-                trade_type=data['trade_type'],
-                amount=float(data['quantity']),
-                stop_loss=float(data.get('stop_loss', 0)) if data.get('stop_loss') else None,
-                take_profit=float(data.get('take_profit', 0)) if data.get('take_profit') else None
+                symbol=symbol,
+                trade_type=trade_type,
+                amount=float(quantity),
+                stop_loss=float(stop_loss) if stop_loss else None,
+                take_profit=float(take_profit) if take_profit else None,
             )
             
             if result.get('success'):
-                logger.info(f"Trade placed through Deriv API: {trade.id}")
+                logger.info("Trade placed through Deriv API: %s", trade.id)
             else:
-                logger.error(f"Deriv API error: {result.get('error')}")
+                logger.error("Deriv API error: %s", result.get('error'))
         else:
             logger.warning("Deriv API not connected, trade placed locally only")
         
         return Response({
             'trade_id': trade.id,
-            'message': f"{data['trade_type']} order placed successfully",
+            'message': f"{trade_type} order placed successfully",
             'entry_price': float(trade.entry_price),
             'deriv_connected': deriv_client.is_connected
         })
         
     except CurrencyPair.DoesNotExist:
         return Response({'error': 'Currency pair not found'}, status=404)
-    except Exception as e:
-        logger.error(f"Error placing trade: {e}")
-        return Response({'error': str(e)}, status=500)
+    except Exception:
+        logger.exception('Error placing trade')
+        return Response(
+            {'error': 'Could not place the trade.'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(['POST'])
+@authentication_classes([BearerTokenAuthentication])
+@permission_classes([IsAuthenticated])
 def close_trade(request, trade_id):
     """Close an open trade"""
     try:
@@ -202,11 +297,16 @@ def close_trade(request, trade_id):
             'deriv_connected': deriv_client.is_connected
         })
         
-    except Exception as e:
-        logger.error(f"Error closing trade: {e}")
-        return Response({'error': str(e)}, status=500)
+    except Exception:
+        logger.exception('Error closing trade')
+        return Response(
+            {'error': 'Could not close the trade.'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 @api_view(['GET'])
+@authentication_classes([BearerTokenAuthentication])
+@permission_classes([IsAuthenticated])
 def get_trades(request):
     """Get all trades"""
     trades = Trade.objects.all()
@@ -230,6 +330,8 @@ def get_trades(request):
     return Response(data)
 
 @api_view(['GET'])
+@authentication_classes([BearerTokenAuthentication])
+@permission_classes([IsAuthenticated])
 def get_portfolio_summary(request):
     """Get portfolio summary"""
     open_trades = Trade.objects.filter(status='OPEN')
@@ -252,6 +354,8 @@ def get_portfolio_summary(request):
     })
 
 @api_view(['GET'])
+@authentication_classes([BearerTokenAuthentication])
+@permission_classes([IsAuthenticated])
 def get_deriv_status(request):
     """Get Deriv API connection status"""
     return Response({
@@ -262,6 +366,8 @@ def get_deriv_status(request):
     })
 
 @api_view(['GET'])
+@authentication_classes([BearerTokenAuthentication])
+@permission_classes([IsAuthenticated, IsAdminUser])
 def get_account_info(request):
     """Get Deriv account information"""
     try:
@@ -287,6 +393,9 @@ def get_account_info(request):
             'deriv_connected': deriv_client.is_connected
         })
         
-    except Exception as e:
-        logger.error(f"Error getting account info: {e}")
-        return Response({'error': str(e)}, status=500)
+    except Exception:
+        logger.exception('Error getting account info')
+        return Response(
+            {'error': 'Could not load account info.'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
