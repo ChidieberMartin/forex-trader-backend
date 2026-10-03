@@ -43,12 +43,18 @@ if SECRET_KEY.lower() in _PLACEHOLDER_SECRETS:
         )
     SECRET_KEY = 'django-insecure-development-only-do-not-use-in-production'
 
-ALLOWED_HOSTS = [
+# The Render host is always accepted so the service answers on its canonical
+# URL; DJANGO_ALLOWED_HOSTS *extends* this list for custom/staging domains.
+_RENDER_HOST = 'forex-trader-backend.onrender.com'
+_extra_allowed_hosts = [
     host.strip()
-    for host in os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+    for host in os.getenv('DJANGO_ALLOWED_HOSTS', '').split(',')
     if host.strip()
 ]
-if not DEBUG and set(ALLOWED_HOSTS) <= {'localhost', '127.0.0.1'}:
+ALLOWED_HOSTS = list(
+    dict.fromkeys([_RENDER_HOST, 'localhost', '127.0.0.1', *_extra_allowed_hosts])
+)
+if not DEBUG and not _extra_allowed_hosts:
     raise ImproperlyConfigured(
         'DJANGO_ALLOWED_HOSTS must list the real hostnames in production.'
     )
@@ -86,6 +92,10 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # CorsMiddleware must sit above anything that can generate a response,
+    # otherwise a preflight (OPTIONS) short-circuits before the CORS headers
+    # are attached and the browser reports "No 'Access-Control-Allow-Origin'".
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -93,7 +103,6 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    'corsheaders.middleware.CorsMiddleware',
 ]
 
 REST_FRAMEWORK = {
@@ -116,15 +125,47 @@ REST_FRAMEWORK = {
     },
 }
 
+# Explicit origin allowlist -- never CORS_ALLOW_ALL_ORIGINS in production.
+# Defaults cover the Vercel deployment plus the CRA (3000) and Vite (5173)
+# dev servers; override CORS_ALLOWED_ORIGINS to change them without a code deploy.
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         'CORS_ALLOWED_ORIGINS',
-        'http://localhost:3000,http://127.0.0.1:3000',
+        'https://forex-trader-frontend.vercel.app,'
+        'http://localhost:3000,'
+        'http://localhost:5173',
     ).split(',')
     if origin.strip()
 ]
+# The frontend authenticates with `Authorization: Bearer <token>`, and
+# CORS_ALLOW_CREDENTIALS covers the session-cookie path.
 CORS_ALLOW_CREDENTIALS = True
+# Listed explicitly (matching the library default) so the Authorization header
+# the API client sends can never silently stop being allowed.
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
+
+# Needed for any session-authenticated call; must include the scheme.
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        'CSRF_TRUSTED_ORIGINS',
+        'https://forex-trader-frontend.vercel.app,'
+        'http://localhost:3000,'
+        'http://localhost:5173',
+    ).split(',')
+    if origin.strip()
+]
 
 # Hardening applied whenever DEBUG is off (i.e. any real deployment).
 if not DEBUG:
