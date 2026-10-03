@@ -152,14 +152,14 @@ def forgot_password(request):
         )
         reset_url = f"{FRONTEND_URL}/reset-password/{token.key}"
         _send_email(
-            'FXPilot - Reset your password',
+            'OKORO FX - Reset your password',
             f"Hi {user.first_name or 'there'},\n\n"
             "You requested to reset your password. Click the link below (valid for one use):\n\n"
             f"{reset_url}\n\n"
             "If you didn't request this, you can ignore this email.\n\n"
-            "— The FXPilot team",
-            user.email,
-        )
+"— The OKORO FX team · Your Gateway To Global Markets",
+        user.email,
+    )
 
     return Response(
         {'message': 'If that email is registered, a reset link has been sent.'}
@@ -247,14 +247,14 @@ def invite_user(request):
 
     invite_url = f"{FRONTEND_URL}/signup?invite={invite.token}"
     _send_email(
-        'FXPilot - You are invited as an admin',
+        'OKORO FX - You are invited as an admin',
         f"Hi,\n\n"
         f"{request.user.first_name or request.user.email} has invited you to join "
-        "FXPilot as an administrator.\n\n"
+        "OKORO FX as an administrator.\n\n"
         f"Open the link below to set up your admin account:\n\n"
         f"{invite_url}\n\n"
         "This link is single-use and expires once your account is created.\n\n"
-        "— The FXPilot team",
+        "— The OKORO FX team · Your Gateway To Global Markets",
         email,
     )
 

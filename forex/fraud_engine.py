@@ -1,5 +1,5 @@
 """
-Fraud detection engine for the FXPilot platform.
+Fraud detection engine for the OKORO FX platform.
 
 This is currently a deterministic, rule-based risk scorer that produces a
 0-100 "fraud score" for a given user, along with human-readable reasons.
